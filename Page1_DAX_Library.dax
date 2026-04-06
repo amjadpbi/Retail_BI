@@ -1,0 +1,414 @@
+-- ============================================================
+-- RETAIL BI — PAGE 1 COMPLETE DAX & COMPONENTS
+-- Muhammad Amjad | Power BI Specialist | Pipeline-First
+-- ============================================================
+-- Measure table: Modeling → New Table → _P1_Measures = {""}
+-- All measures go inside this table unless noted otherwise.
+-- ============================================================
+
+
+-- ============================================================
+-- SECTION 1 — CORE KPI MEASURES
+-- ============================================================
+
+Net Sales =
+    SUM(FactSales[NetSaleAmount])
+
+COGS =
+    SUMX(
+        VALUES(DimProduct[ProductKey]),
+        VAR QtySold =
+            CALCULATE(SUM(FactSales[Quantity]))
+        VAR AvgCost =
+            CALCULATE(
+                AVERAGE(FactPurchases[UnitPurchasePrice]),
+                REMOVEFILTERS(DimDate)
+            )
+        RETURN
+            QtySold * AvgCost
+    )
+
+Gross Profit =
+    [Net Sales] - [COGS]
+
+Gross Profit % =
+    DIVIDE([Gross Profit], [Net Sales], 0)
+
+Total Expenses =
+    SUM(FactExpenses[ExpenseAmount])
+-- All expense accounts summed. No BU split here.
+-- Shared expenses already at 50/50 in data so combined
+-- total is the true business total when both BUs selected.
+
+Net Profit =
+    [Gross Profit] - [Total Expenses]
+
+Net Profit % =
+    DIVIDE([Net Profit], [Net Sales], 0)
+
+
+-- ============================================================
+-- SECTION 2 — KPI DISPLAY LABELS
+-- (use as KPI card "Value" with blank "Target" field)
+-- ============================================================
+
+KPI Sales Label =
+    "Rs. " & FORMAT([Net Sales] / 1000000, "0.00") & "M"
+
+KPI COGS Label =
+    "Rs. " & FORMAT([COGS] / 1000000, "0.00") & "M"
+
+KPI Expenses Label =
+    "Rs. " & FORMAT([Total Expenses] / 1000, "0.0") & "K"
+
+KPI Net Profit Label =
+    "Rs. " & FORMAT([Net Profit] / 1000000, "0.00") & "M"
+
+KPI Gross Margin Label =
+    FORMAT([Gross Profit %], "0.0%") & " margin"
+
+KPI Net Margin Label =
+    FORMAT([Net Profit %], "0.0%") & " of sales"
+
+
+-- ============================================================
+-- SECTION 3 — DYNAMIC PAGE TITLE
+-- Assign to a Card visual, format as title text.
+-- ============================================================
+
+Page Title =
+    VAR SelectedBU =
+        SELECTEDVALUE(DimBusinessUnit[BusinessUnitName], "All Business Units")
+    RETURN
+        IF(
+            SelectedBU = "All Business Units",
+            "Retail BI — Executive Summary",
+            "Retail BI — " & SelectedBU & " — Executive Summary"
+        )
+
+-- HOW TO USE:
+-- Insert a Card visual at the top of the page canvas.
+-- Values field → [Page Title]
+-- Format → Callout value → font size 16, weight 500
+-- Turn off Category label.
+-- This card becomes the dynamic page heading.
+
+
+-- ============================================================
+-- SECTION 4 — LINE CHART (Daily sales, current vs prev month)
+-- ============================================================
+
+-- Current month daily sales — respects Year + Month slicer
+Daily Net Sales =
+    SUM(FactSales[NetSaleAmount])
+-- This is just [Net Sales] but named separately for clarity
+-- in the line chart visual field configuration.
+
+-- Previous month daily sales — shifts the date context back
+-- exactly one calendar month. Works correctly across year
+-- boundaries (e.g. Jan 2024 previous = Dec 2023).
+Prev Month Daily Sales =
+    VAR CurrentDate =
+        SELECTEDVALUE(DimDate[Date])
+    VAR PrevMonthDate =
+        EDATE(CurrentDate, -1)
+    RETURN
+        CALCULATE(
+            SUM(FactSales[NetSaleAmount]),
+            FILTER(
+                ALL(DimDate),
+                DimDate[Date] = PrevMonthDate
+            )
+        )
+-- LINE CHART SETUP:
+-- X-axis:   DimDate[Day]  (day of month 1-31)
+-- Values:   [Daily Net Sales]   → solid line, primary color
+--           [Prev Month Daily Sales] → dashed line, muted color
+-- The year + month slicers filter the date context.
+-- Both lines show day 1 to day N of their respective months
+-- aligned on the same x-axis so day 1 of Dec aligns with
+-- day 1 of Nov for visual comparison.
+
+-- NOTE: When January is selected, Prev Month Daily Sales
+-- will return blank for each day because December of the
+-- prior year is outside the dataset only in edge cases.
+-- Jan 2023 has no previous month — the dashed line
+-- simply does not appear. No error, no zero line.
+
+-- Tooltip measure for line chart (shows date context clearly)
+Line Tooltip =
+    VAR D = SELECTEDVALUE(DimDate[Date])
+    VAR M = SELECTEDVALUE(DimDate[MonthName])
+    VAR Y = SELECTEDVALUE(DimDate[Year])
+    RETURN
+        M & " " & D & ", " & Y
+
+
+-- ============================================================
+-- SECTION 5 — PAYMENT BALANCES
+-- Closing balance on the last day of the selected period.
+-- Works correctly for any month selected via the slicer.
+-- ============================================================
+
+Cash Closing Balance =
+    VAR LastDay =
+        MAXX(
+            FILTER(
+                ALL(FactPayments),
+                FactPayments[PaymentMethodKey] = 1
+                    && FactPayments[DateKey]
+                       IN VALUES(DimDate[DateKey])
+            ),
+            FactPayments[DateKey]
+        )
+    RETURN
+        CALCULATE(
+            SUM(FactPayments[ClosingBalance]),
+            FactPayments[PaymentMethodKey] = 1,
+            FactPayments[DateKey] = LastDay,
+            ALL(DimDate)
+        )
+
+Bank Closing Balance =
+    VAR LastDay =
+        MAXX(
+            FILTER(
+                ALL(FactPayments),
+                FactPayments[PaymentMethodKey] = 2
+                    && FactPayments[DateKey]
+                       IN VALUES(DimDate[DateKey])
+            ),
+            FactPayments[DateKey]
+        )
+    RETURN
+        CALCULATE(
+            SUM(FactPayments[ClosingBalance]),
+            FactPayments[PaymentMethodKey] = 2,
+            FactPayments[DateKey] = LastDay,
+            ALL(DimDate)
+        )
+
+Wallet Closing Balance =
+    VAR LastDay =
+        MAXX(
+            FILTER(
+                ALL(FactPayments),
+                FactPayments[PaymentMethodKey] = 3
+                    && FactPayments[DateKey]
+                       IN VALUES(DimDate[DateKey])
+            ),
+            FactPayments[DateKey]
+        )
+    RETURN
+        CALCULATE(
+            SUM(FactPayments[ClosingBalance]),
+            FactPayments[PaymentMethodKey] = 3,
+            FactPayments[DateKey] = LastDay,
+            ALL(DimDate)
+        )
+
+Total Cash Position =
+    [Cash Closing Balance]
+    + [Bank Closing Balance]
+    + [Wallet Closing Balance]
+
+-- BALANCE CARD LABELS
+Cash Balance Label =
+    "Rs. " & FORMAT([Cash Closing Balance] / 1000000, "0.00") & "M"
+
+Bank Balance Label =
+    "Rs. " & FORMAT([Bank Closing Balance] / 1000000, "0.00") & "M"
+
+Wallet Balance Label =
+    "Rs. " & FORMAT([Wallet Closing Balance] / 1000000, "0.00") & "M"
+
+Total Position Label =
+    "Rs. " & FORMAT([Total Cash Position] / 1000000, "0.00") & "M"
+
+
+-- ============================================================
+-- SECTION 6 — P&L TABLE MEASURES
+-- Used in the matrix visual — Business Unit on rows.
+-- All measures respond to BU row context automatically
+-- because DimBusinessUnit filters each fact table.
+-- ============================================================
+
+-- These are the same core measures from Section 1.
+-- No additional DAX needed for the P&L table.
+-- Matrix setup:
+--   Rows:    DimBusinessUnit[BusinessUnitName]
+--   Values:  [Net Sales], [COGS], [Gross Profit], [Total Expenses], [Net Profit]
+--   Subtotals: ON (shows combined total row automatically)
+
+-- Conditional formatting measure for Net Profit column
+Net Profit CF Color =
+    IF([Net Profit] >= 0, "#107C10", "#C50F1F")
+-- Apply to Net Profit column:
+-- Column → Conditional formatting → Font color → Field value → [Net Profit CF Color]
+
+
+-- ============================================================
+-- SECTION 7 — THREE-MODE BAR CHART (Bookmarks approach)
+-- ============================================================
+-- Three separate bar chart visuals on the canvas, positioned
+-- on top of each other exactly. Bookmarks show/hide them.
+-- One set of toggle buttons drives all three bookmarks.
+--
+-- VISUAL 1 — Sales by Category
+--   X-axis:  DimCategory[CategoryName]
+--   Y-axis:  [Net Sales]
+--   Sort:    Y-axis descending
+--   Title:   "Sales by Category"
+--
+-- VISUAL 2 — Profit by Category
+--   X-axis:  DimCategory[CategoryName]
+--   Y-axis:  [Gross Profit]
+--   Sort:    Y-axis descending
+--   Title:   "Gross Profit by Category"
+--
+-- VISUAL 3 — Expenses by Account
+--   X-axis:  DimExpenseAccount[AccountName]
+--   Y-axis:  [Total Expenses]
+--   Sort:    Y-axis descending
+--   Title:   "Expenses by Type"
+--   IMPORTANT: Set this visual to IGNORE the BU slicer
+--              (Edit interactions → set BU slicer → None on this visual)
+--              Total expenses across all accounts regardless of BU selection.
+--
+-- BOOKMARK SETUP:
+--   1. Position all three visuals identically on canvas
+--   2. Open Selection pane (View → Selection)
+--   3. Name them: "VizSales", "VizProfit", "VizExpenses"
+--   4. Create three bookmarks:
+--        "BM_Sales"    → VizSales visible,   VizProfit hidden, VizExpenses hidden
+--        "BM_Profit"   → VizSales hidden,    VizProfit visible, VizExpenses hidden
+--        "BM_Expenses" → VizSales hidden,    VizProfit hidden,  VizExpenses visible
+--   5. Each bookmark: tick "Selected visuals only" so it only
+--      controls visibility, not filters or slicer state.
+--
+-- TOGGLE BUTTONS:
+--   Insert → Buttons → Blank (×3)
+--   Label: "Sales", "Profit", "Expenses"
+--   Action: Bookmark → BM_Sales / BM_Profit / BM_Expenses
+--   Style the active button differently using conditional formatting
+--   or accept that Power BI native buttons show pressed state on click.
+--   Place buttons as a horizontal strip above the bar chart area.
+
+
+-- ============================================================
+-- SECTION 8 — HEATMAP MATRIX
+-- ============================================================
+-- No additional DAX needed beyond [Net Sales].
+-- Requires one calculated column in DimDate for sort order.
+
+-- ADD THIS AS A CALCULATED COLUMN IN DimDate TABLE:
+-- Column name: WeekDaySort
+WeekDaySort =
+    SWITCH(
+        DimDate[WeekDayNumber],
+        1, 7,   -- Sunday moves to end
+        DimDate[WeekDayNumber] - 1
+    )
+-- Result: Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6, Sun=7
+-- Then: DimDate[WeekDay] column → Column tools → Sort by column → WeekDaySort
+
+-- MATRIX SETUP:
+--   Rows:    DimDate[WeekDay]  (sorted by WeekDaySort)
+--   Columns: FactSales[TransactionHour]
+--   Values:  [Net Sales]  or COUNT of FactSales[SalesKey]
+--   Turn off: Row subtotals, Column subtotals
+--   Conditional formatting on Values:
+--     Background color → Color scale
+--     Min: white  |  Max: dark blue (#004578)
+--   Column header: format TransactionHour as "HH:00"
+--   This visual DOES respond to Year + Month slicer.
+--   Shows the hourly pattern for the selected period.
+
+
+-- ============================================================
+-- SECTION 9 — YEAR AND MONTH SLICERS
+-- ============================================================
+-- YEAR SLICER:
+--   Visual: Slicer
+--   Field:  DimDate[Year]
+--   Style:  Tile (not dropdown or list)
+--   Selection: Single select
+--   Default: 2024 (most recent year)
+--   Sync across pages: YES
+--
+-- MONTH SLICER:
+--   Visual: Slicer
+--   Field:  DimDate[MonthName]
+--   Style:  Tile
+--   Selection: Single select
+--   Sort by: DimDate[Month] (number) not alphabetical
+--   Default: December
+--   Sync across pages: YES
+--
+-- MONTH SORT FIX — add calculated column to DimDate:
+Month Sort =
+    DimDate[Month]
+-- Then: DimDate[MonthName] → Sort by column → Month Sort
+-- Without this, months sort alphabetically (Apr, Aug, Dec...)
+--
+-- BU SLICER:
+--   Visual: Slicer
+--   Field:  DimBusinessUnit[BusinessUnitName]
+--   Style:  Tile
+--   Selection: Multi select with Select All option
+--   Default: All selected
+--   Sync across pages: YES
+--   Exception: set interaction to NONE on the Expenses
+--              bar chart visual (Visual 3 in bookmarks)
+
+
+-- ============================================================
+-- SECTION 10 — DEFAULT STATE BOOKMARK
+-- ============================================================
+-- 1. Set Year slicer → 2024
+-- 2. Set Month slicer → December
+-- 3. Set BU slicer → All selected
+-- 4. Set bar chart to Sales mode (BM_Sales bookmark active)
+-- 5. View → Bookmarks → Add bookmark → name: "Page1_Default"
+-- 6. File → Options → Report settings → Default bookmark
+--    → select "Page1_Default"
+-- Every page open lands on Dec 2024, Sales mode, both BUs.
+
+
+-- ============================================================
+-- SECTION 11 — CROSS-FILTER INTERACTION MAP
+-- Configure via Format ribbon → Edit Interactions
+-- ============================================================
+--
+-- SOURCE             TARGET                    INTERACTION
+-- ─────────────────  ────────────────────────  ──────────────
+-- Year slicer        All visuals               Filter
+-- Month slicer       All visuals               Filter
+-- BU slicer          KPI cards                 Filter
+--                    Line chart                Filter
+--                    P&L table                 Filter
+--                    Payment balances          Filter
+--                    Heatmap                   Filter
+--                    VizSales (bar)            Filter
+--                    VizProfit (bar)           Filter
+--                    VizExpenses (bar)         NONE
+--
+-- Category bar click KPI cards                 Highlight
+--                    Line chart                Highlight
+--                    P&L table                 Highlight
+--                    Heatmap                   Highlight
+--
+-- Heatmap cell click KPI cards                 Highlight
+--                    Line chart                Highlight
+--                    Category bar              Highlight
+--
+-- P&L table row      KPI cards                 Highlight
+-- click              Line chart                Highlight
+--                    Category bar              Highlight
+--                    Heatmap                   Highlight
+
+
+-- ============================================================
+-- END OF PAGE 1 DAX & COMPONENTS
+-- Retail BI | March 2026
+-- ============================================================

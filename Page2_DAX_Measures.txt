@@ -1,0 +1,646 @@
+================================================================
+RETAIL BI — PAGE 2: PRODUCTS AND SUPPLIER INTELLIGENCE
+DAX MEASURES — COMPLETE REFERENCE
+Muhammad Amjad | Power BI Specialist | March 2026
+================================================================
+
+All measures assume star schema with:
+  FactSales, FactPurchases, DimProduct, DimDate,
+  DimCategory, DimSupplier, DimBusinessUnit
+
+================================================================
+GROUP 0 — BASE MEASURES (shared across all sections)
+================================================================
+
+-- Core revenue and cost base used everywhere on the page
+
+Total Revenue =
+SUM(FactSales[NetSaleAmount])
+
+Total Qty Sold =
+SUM(FactSales[Quantity])
+
+Total Qty Purchased =
+SUM(FactPurchases[Quantity])
+
+Total Purchase Amount =
+SUM(FactPurchases[TotalPurchaseAmount])
+
+Avg Unit Purchase Price =
+AVERAGE(FactPurchases[UnitPurchasePrice])
+
+Avg Unit Sale Price =
+AVERAGE(FactSales[UnitSalePrice])
+
+-- COGS: average purchase cost per product x qty sold
+-- Uses ALL(DimDate) on purchases so cost is not filtered by slicer date
+Total COGS =
+SUMX(
+    VALUES(DimProduct[ProductKey]),
+    VAR avgCost =
+        CALCULATE(
+            AVERAGE(FactPurchases[UnitPurchasePrice]),
+            ALL(DimDate)
+        )
+    VAR qtySold = CALCULATE(SUM(FactSales[Quantity]))
+    RETURN
+        IF(NOT ISBLANK(qtySold), avgCost * qtySold, 0)
+)
+
+Gross Margin =
+[Total Revenue] - [Total COGS]
+
+Gross Margin % =
+DIVIDE([Gross Margin], [Total Revenue], 0)
+
+-- System stock derived from all-time purchases minus all-time sales
+-- This is Phase 1 approximation. Phase 2 uses FactStockReconciliation.
+System Stock Qty =
+VAR allPurchased =
+    CALCULATE(
+        SUM(FactPurchases[Quantity]),
+        ALL(DimDate)
+    )
+VAR allSold =
+    CALCULATE(
+        SUM(FactSales[Quantity]),
+        ALL(DimDate)
+    )
+RETURN
+    allPurchased - allSold
+
+-- Last purchase cost per product (most recent purchase date)
+Last Purchase Cost =
+CALCULATE(
+    AVERAGEX(
+        TOPN(1, FactPurchases, FactPurchases[DateKey], DESC),
+        FactPurchases[UnitPurchasePrice]
+    ),
+    ALL(DimDate)
+)
+
+
+================================================================
+GROUP 1 — KPI CARDS (no MoM, no YoY — balance/count only)
+================================================================
+
+-- Card 1: Total Revenue
+-- Use [Total Revenue] directly on card. Respects slicer.
+
+-- Card 2: Gross Margin %
+-- Use [Gross Margin %] directly on card.
+
+-- Card 3: Products Below Reorder Level (count)
+KPI Products Below Reorder =
+CALCULATE(
+    COUNTROWS(DimProduct),
+    FILTER(
+        DimProduct,
+        [System Stock Qty] < DimProduct[ReorderLevel]
+            && DimProduct[IsActive] = 1
+    )
+)
+
+-- Card 4: Dead Stock Value (capital locked, zero sales 30+ days)
+KPI Dead Stock Value =
+SUMX(
+    FILTER(
+        DimProduct,
+        DimProduct[IsActive] = 1
+    ),
+    VAR lastSaleDate =
+        CALCULATE(
+            MAX(DimDate[Date]),
+            FactSales,
+            ALL(DimDate)
+        )
+    VAR daysSince =
+        IF(
+            ISBLANK(lastSaleDate),
+            999,
+            DATEDIFF(lastSaleDate, TODAY(), DAY)
+        )
+    VAR stockQty = CALCULATE([System Stock Qty])
+    VAR lastCost = CALCULATE([Last Purchase Cost])
+    RETURN
+        IF(daysSince >= 30, stockQty * lastCost, 0)
+)
+
+-- Card 5: Estimated Supplier Overpay Amount
+-- Amount paid above cheapest available supplier price (all time)
+KPI Supplier Overpay Amount =
+SUMX(
+    FactPurchases,
+    VAR thisProductKey = FactPurchases[ProductKey]
+    VAR thisUnitPrice  = FactPurchases[UnitPurchasePrice]
+    VAR cheapestPrice  =
+        CALCULATE(
+            MIN(FactPurchases[UnitPurchasePrice]),
+            ALL(DimSupplier),
+            FILTER(
+                ALL(FactPurchases),
+                FactPurchases[ProductKey] = thisProductKey
+            )
+        )
+    RETURN
+        MAX(thisUnitPrice - cheapestPrice, 0) * FactPurchases[Quantity]
+)
+
+
+================================================================
+GROUP 2 — RESTOCK ALERT + NEXT WEEK PREDICTION
+================================================================
+
+-- Rolling last 7 days quantity sold per product
+-- Anchor: last available date in current filter context
+Last 7 Days Qty Sold =
+VAR lastDate = CALCULATE(MAX(DimDate[Date]), ALL(DimDate))
+VAR startDate = lastDate - 6
+RETURN
+CALCULATE(
+    SUM(FactSales[Quantity]),
+    DimDate[Date] >= startDate && DimDate[Date] <= lastDate
+)
+
+-- Average daily sales over last 7 days
+Last 7 Days Avg Daily Sales =
+DIVIDE([Last 7 Days Qty Sold], 7, 0)
+
+-- Next 7 days predicted demand based on last week velocity
+Next Week Predicted Demand =
+[Last 7 Days Avg Daily Sales] * 7
+
+-- Units needed to cover next week after current stock
+Restock Qty Needed =
+VAR stockNow   = [System Stock Qty]
+VAR nextWeek   = [Next Week Predicted Demand]
+VAR gap        = nextWeek - stockNow
+RETURN
+    IF(gap > 0, gap, 0)
+
+-- Alert label for table conditional formatting
+Restock Alert Status =
+VAR stockNow  = [System Stock Qty]
+VAR reorder   = MAX(DimProduct[ReorderLevel])
+VAR nextWeek  = [Next Week Predicted Demand]
+RETURN
+SWITCH(
+    TRUE(),
+    stockNow <= 0,               "Out of Stock",
+    stockNow < reorder,          "Below Reorder",
+    stockNow < nextWeek,         "Restock This Week",
+    "OK"
+)
+
+-- Days of stock remaining at current sell rate
+Days of Stock Remaining =
+VAR avgDaily = [Last 7 Days Avg Daily Sales]
+VAR stockNow = [System Stock Qty]
+RETURN
+    IF(avgDaily > 0, INT(DIVIDE(stockNow, avgDaily, 0)), BLANK())
+
+-- ------ TABLE: Restock Alert Visual ------
+-- Rows:    DimProduct[ProductName], DimCategory[CategoryName]
+-- Columns: [System Stock Qty], DimProduct[ReorderLevel],
+--          [Last 7 Days Qty Sold], [Next Week Predicted Demand],
+--          [Restock Qty Needed], [Days of Stock Remaining],
+--          [Restock Alert Status]
+-- Filter:  [Restock Alert Status] <> "OK"
+-- Sort:    [Days of Stock Remaining] ascending (most urgent top)
+-- Conditional formatting on [Restock Alert Status]:
+--    Out of Stock      = Red background
+--    Below Reorder     = Orange background
+--    Restock This Week = Yellow background
+
+
+================================================================
+GROUP 3 — DEAD STOCK TRACKING (zero sales 30 days)
+================================================================
+
+-- Last date any sale was recorded for the product (all time)
+Last Sale Date =
+CALCULATE(
+    MAX(DimDate[Date]),
+    FactSales,
+    ALL(DimDate)
+)
+
+-- Days elapsed since last sale against TODAY()
+Days Since Last Sale =
+VAR lastSale = [Last Sale Date]
+RETURN
+    IF(
+        ISBLANK(lastSale),
+        999,
+        DATEDIFF(lastSale, TODAY(), DAY)
+    )
+
+-- Binary flag: 1 = dead stock
+Is Dead Stock =
+IF([Days Since Last Sale] >= 30, 1, 0)
+
+-- Capital locked: system stock qty x last purchase cost
+Dead Stock Capital Locked =
+VAR stockQty  = [System Stock Qty]
+VAR lastCost  = [Last Purchase Cost]
+VAR isDead    = [Is Dead Stock]
+RETURN
+    IF(isDead = 1, stockQty * lastCost, 0)
+
+-- Aging bucket for dead stock table
+Dead Stock Aging Bucket =
+VAR d = [Days Since Last Sale]
+RETURN
+SWITCH(
+    TRUE(),
+    d = 999,    "Never Sold",
+    d >= 90,    "90+ Days",
+    d >= 60,    "60-90 Days",
+    d >= 30,    "30-60 Days",
+    "Active"
+)
+
+-- Total dead stock count for KPI (used by Card 4 above indirectly)
+Dead Stock Product Count =
+CALCULATE(
+    COUNTROWS(DimProduct),
+    FILTER(
+        DimProduct,
+        [Is Dead Stock] = 1 && DimProduct[IsActive] = 1
+    )
+)
+
+-- ------ TABLE/BAR: Dead Stock Visual ------
+-- Rows:    DimProduct[ProductName], DimCategory[CategoryName]
+-- Columns: [Last Sale Date], [Days Since Last Sale],
+--          [Dead Stock Aging Bucket], [System Stock Qty],
+--          [Last Purchase Cost], [Dead Stock Capital Locked]
+-- Filter:  [Is Dead Stock] = 1
+-- Sort:    [Dead Stock Capital Locked] descending
+-- Bar chart alternative: ProductName on Y-axis,
+--          [Dead Stock Capital Locked] on X-axis,
+--          color by [Dead Stock Aging Bucket]
+
+
+================================================================
+GROUP 4 — 80/20 PRODUCT REVENUE (PARETO)
+================================================================
+
+-- Revenue per product in current filter context
+Product Revenue =
+SUM(FactSales[NetSaleAmount])
+
+-- Total revenue ignoring product filter (denominator for %)
+Total Revenue All Products =
+CALCULATE(
+    [Product Revenue],
+    ALL(DimProduct)
+)
+
+-- Revenue share of each product
+Product Revenue % =
+DIVIDE([Product Revenue], [Total Revenue All Products], 0)
+
+-- Rank products by revenue descending within current context
+Product Revenue Rank =
+RANKX(
+    ALL(DimProduct[ProductName]),
+    [Product Revenue],
+    ,
+    DESC,
+    DENSE
+)
+
+-- Cumulative revenue % up to and including this product's rank
+Cumulative Revenue % =
+VAR currentRank = [Product Revenue Rank]
+RETURN
+CALCULATE(
+    [Product Revenue %],
+    FILTER(
+        ALL(DimProduct[ProductName]),
+        [Product Revenue Rank] <= currentRank
+    )
+)
+
+-- Pareto classification label
+Pareto Band =
+SWITCH(
+    TRUE(),
+    [Cumulative Revenue %] <= 0.5,  "Top 50%",
+    [Cumulative Revenue %] <= 0.8,  "Core 80%",
+    "Long Tail"
+)
+
+-- Flag: is this product in the top 20% by count that drives 80% revenue
+Is Top 20 Pct Product =
+VAR totalProducts =
+    CALCULATE(COUNTROWS(DimProduct), ALL(DimProduct))
+VAR top20Threshold = INT(totalProducts * 0.2)
+RETURN
+    IF([Product Revenue Rank] <= top20Threshold, 1, 0)
+
+-- ------ PARETO CHART SETUP ------
+-- Visual type: Clustered bar + line combo (custom visual or built-in)
+-- X-axis:      DimProduct[ProductName] sorted by [Product Revenue] DESC
+--              (top 30-50 products for readability)
+-- Bar (Y1):    [Product Revenue]
+-- Line (Y2):   [Cumulative Revenue %] — secondary axis 0% to 100%
+-- Reference line at 80% on secondary axis
+-- Color bars by [Pareto Band]
+-- Filter:      Show top N products using TopN filter on [Product Revenue]
+--              Recommended N = 30 for this canvas size
+
+
+================================================================
+GROUP 5 — MARGIN EROSION TRACKER
+================================================================
+
+-- Current selected month average purchase cost
+Current Month Avg Cost =
+CALCULATE(
+    AVERAGE(FactPurchases[UnitPurchasePrice]),
+    DATESMTD(DimDate[Date])
+)
+
+-- Previous month average purchase cost
+Prev Month Avg Cost =
+CALCULATE(
+    AVERAGE(FactPurchases[UnitPurchasePrice]),
+    DATEADD(DATESMTD(DimDate[Date]), -1, MONTH)
+)
+
+-- Purchase cost change % month over month
+Purchase Cost Change % =
+DIVIDE(
+    [Current Month Avg Cost] - [Prev Month Avg Cost],
+    [Prev Month Avg Cost],
+    0
+)
+
+-- Current month average sale price
+Current Month Avg Sale Price =
+CALCULATE(
+    AVERAGE(FactSales[UnitSalePrice]),
+    DATESMTD(DimDate[Date])
+)
+
+-- Previous month average sale price
+Prev Month Avg Sale Price =
+CALCULATE(
+    AVERAGE(FactSales[UnitSalePrice]),
+    DATEADD(DATESMTD(DimDate[Date]), -1, MONTH)
+)
+
+-- Sale price change % month over month
+Sale Price Change % =
+DIVIDE(
+    [Current Month Avg Sale Price] - [Prev Month Avg Sale Price],
+    [Prev Month Avg Sale Price],
+    0
+)
+
+-- Current margin % in selected period
+Current Margin % =
+DIVIDE(
+    [Current Month Avg Sale Price] - [Current Month Avg Cost],
+    [Current Month Avg Sale Price],
+    0
+)
+
+-- Previous period margin %
+Prev Month Margin % =
+DIVIDE(
+    [Prev Month Avg Sale Price] - [Prev Month Avg Cost],
+    [Prev Month Avg Sale Price],
+    0
+)
+
+-- Margin change in percentage points (positive = improving)
+Margin Change Pts =
+[Current Margin %] - [Prev Month Margin %]
+
+-- Erosion flag: cost went up but price stayed flat or dropped
+Margin Erosion Flag =
+VAR costRose    = [Purchase Cost Change %] > 0.005
+VAR priceFlat   = ABS([Sale Price Change %]) < 0.005
+RETURN
+    SWITCH(
+        TRUE(),
+        costRose && priceFlat,                          "Eroding",
+        [Purchase Cost Change %] > 0.02,               "Watch",
+        [Margin Change Pts] < -0.03,                   "Watch",
+        "Stable"
+    )
+
+-- How much margin is being lost per unit (Rs. value)
+Margin Erosion Per Unit =
+VAR costRise =
+    [Current Month Avg Cost] - [Prev Month Avg Cost]
+RETURN
+    IF([Margin Erosion Flag] = "Eroding", costRise, 0)
+
+-- Total margin erosion impact (Rs.) across all sales in period
+Total Erosion Impact =
+SUMX(
+    VALUES(DimProduct[ProductKey]),
+    [Margin Erosion Per Unit] * CALCULATE(SUM(FactSales[Quantity]))
+)
+
+-- ------ MATRIX: Margin Erosion Visual ------
+-- Rows:    DimProduct[ProductName] filtered to [Margin Erosion Flag] = "Eroding"
+--          (8 grocery products per simulation logic)
+-- Columns: [Prev Month Avg Cost], [Current Month Avg Cost],
+--          [Purchase Cost Change %], [Current Month Avg Sale Price],
+--          [Sale Price Change %], [Current Margin %],
+--          [Margin Change Pts], [Total Erosion Impact]
+-- Sort:    [Total Erosion Impact] descending
+-- Conditional formatting:
+--    [Purchase Cost Change %]  Red data bar (higher = more red)
+--    [Margin Change Pts]       Red if negative, green if positive
+--    [Margin Erosion Flag]     Red pill = Eroding, amber = Watch
+
+
+================================================================
+GROUP 6 — SAME PRODUCT SUPPLIER RATE COMPARISON
+================================================================
+
+-- Average purchase price paid to current supplier
+Supplier Avg Unit Price =
+AVERAGE(FactPurchases[UnitPurchasePrice])
+
+-- Cheapest average price available for same product across all suppliers
+Cheapest Supplier Price =
+CALCULATE(
+    MINX(
+        VALUES(DimSupplier[SupplierKey]),
+        CALCULATE(AVERAGE(FactPurchases[UnitPurchasePrice]))
+    ),
+    ALL(DimSupplier)
+)
+
+-- Premium paid vs cheapest supplier (%)
+Price Premium vs Cheapest % =
+DIVIDE(
+    [Supplier Avg Unit Price] - [Cheapest Supplier Price],
+    [Cheapest Supplier Price],
+    0
+)
+
+-- Rs. premium paid per unit
+Price Premium Per Unit =
+MAX([Supplier Avg Unit Price] - [Cheapest Supplier Price], 0)
+
+-- Total overpay for this supplier-product combination in period
+Total Overpay This Supplier =
+SUMX(
+    FactPurchases,
+    MAX(FactPurchases[UnitPurchasePrice] - [Cheapest Supplier Price], 0)
+        * FactPurchases[Quantity]
+)
+
+-- Label: is this supplier the cheapest source for this product
+Supplier Price Rank =
+RANKX(
+    ALL(DimSupplier[SupplierName]),
+    [Supplier Avg Unit Price],
+    ,
+    ASC,
+    DENSE
+)
+
+Is Cheapest Supplier =
+IF([Supplier Price Rank] = 1, "Cheapest", "Premium")
+
+-- Count of products where this supplier is NOT cheapest
+Products Where Paying Premium =
+CALCULATE(
+    COUNTROWS(VALUES(DimProduct[ProductKey])),
+    FILTER(
+        VALUES(DimProduct[ProductKey]),
+        [Price Premium vs Cheapest %] > 0
+    )
+)
+
+-- ------ CLUSTERED BAR: Supplier Rate Comparison ------
+-- Visual type: Clustered bar chart
+-- Y-axis:  DimProduct[ProductName]
+--          Filter to products bought from 2+ suppliers only
+--          Use this calculated table filter in Power BI:
+--            Products with Multiple Suppliers =
+--            FILTER(
+--                DimProduct,
+--                CALCULATE(
+--                    DISTINCTCOUNT(FactPurchases[SupplierKey])
+--                ) >= 2
+--            )
+-- X-axis:  [Supplier Avg Unit Price]
+-- Legend:  DimSupplier[SupplierName]
+-- Tooltip: [Price Premium vs Cheapest %], [Total Overpay This Supplier]
+-- Sort:    [Price Premium vs Cheapest %] descending (worst offenders top)
+-- Color:   Green bar = cheapest, Red bars = premium suppliers
+--          Use [Is Cheapest Supplier] for conditional color
+
+
+================================================================
+MEASURE TABLE STRUCTURE
+================================================================
+
+Recommended: Create a dedicated Measures table in Power BI
+  - Right-click Model > Enter data > name it "_Measures"
+  - Move all measures into sub-folders:
+
+  _Measures
+      Base/
+          Total Revenue
+          Total COGS
+          Total Qty Sold
+          Total Qty Purchased
+          Total Purchase Amount
+          Avg Unit Purchase Price
+          Avg Unit Sale Price
+          System Stock Qty
+          Last Purchase Cost
+          Gross Margin
+          Gross Margin %
+      KPI Cards/
+          KPI Products Below Reorder
+          KPI Dead Stock Value
+          KPI Supplier Overpay Amount
+      Restock/
+          Last 7 Days Qty Sold
+          Last 7 Days Avg Daily Sales
+          Next Week Predicted Demand
+          Restock Qty Needed
+          Restock Alert Status
+          Days of Stock Remaining
+      Dead Stock/
+          Last Sale Date
+          Days Since Last Sale
+          Is Dead Stock
+          Dead Stock Capital Locked
+          Dead Stock Aging Bucket
+          Dead Stock Product Count
+      Pareto/
+          Product Revenue
+          Total Revenue All Products
+          Product Revenue %
+          Product Revenue Rank
+          Cumulative Revenue %
+          Pareto Band
+          Is Top 20 Pct Product
+      Margin Erosion/
+          Current Month Avg Cost
+          Prev Month Avg Cost
+          Purchase Cost Change %
+          Current Month Avg Sale Price
+          Prev Month Avg Sale Price
+          Sale Price Change %
+          Current Margin %
+          Prev Month Margin %
+          Margin Change Pts
+          Margin Erosion Flag
+          Margin Erosion Per Unit
+          Total Erosion Impact
+      Supplier Rate/
+          Supplier Avg Unit Price
+          Cheapest Supplier Price
+          Price Premium vs Cheapest %
+          Price Premium Per Unit
+          Total Overpay This Supplier
+          Supplier Price Rank
+          Is Cheapest Supplier
+          Products Where Paying Premium
+
+
+================================================================
+DEPENDENCY NOTES
+================================================================
+
+1. System Stock Qty uses ALL(DimDate) — intentional. Stock position
+   is cumulative all-time, not filtered by slicer. Slicer affects
+   sales and purchase analysis measures only.
+
+2. DueDateKey relationships in FactReceivables and FactPayables
+   must be marked INACTIVE in Power BI model view. Use
+   USERELATIONSHIP() if aging by due date is needed on Page 3.
+
+3. Pareto chart requires products sorted by [Product Revenue] DESC.
+   Set sort column in model or use visual-level sort. Do not use
+   alphabetical sort on ProductName for this visual.
+
+4. Margin Erosion measures use DATESMTD and DATEADD. Requires
+   DimDate to be marked as a Date Table in Power BI.
+   Right-click DimDate > Mark as Date Table > select [Date] column.
+
+5. Dead Stock uses TODAY() — value updates on every report refresh.
+   Schedule gateway refresh daily for this to stay current.
+
+6. [Is Dead Stock] filter on visuals: use as a visual-level filter,
+   not a page-level filter. Page-level filter would hide products
+   from the Restock and Pareto visuals.
+
+================================================================
+END OF PAGE 2 DAX MEASURES
+RetailBI_Dev | March 2026
+================================================================
